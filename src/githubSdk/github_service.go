@@ -3,96 +3,182 @@ package githubSdk
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"github.com/google/go-github/v61/github"
-	"os"
 	"strings"
 	"time"
 )
 
 type Client github.Client
 
+//go:embed all:embed
+var embedded embed.FS
 var ctx context.Context
-
-//go:embed embed
-var external embed.FS
+var client *Client
+var user *github.User
 
 func init() {
-	ctx, _ = context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, _ = context.WithTimeout(context.Background(), 720*time.Second)
+}
+func InitClient(accessToken *string) error {
+	client = (*Client)(github.NewClient(nil).WithAuthToken(*accessToken))
+	result, resp, err := client.Users.Get(ctx, "")
+	if err != nil {
+		return err
+	}
+	auth := resp.Response.Header.Get("X-Oauth-Scopes")
+	if !strings.Contains(auth, "repo") {
+		return errors.New("github token does not have repository authorization")
+	} else if !strings.Contains(auth, "workflow") {
+		return errors.New("github token does not have workflow authorization")
+	}
+	user = result
+	return nil
 }
 
-func Example() {
-	token := ""
-	repoName := "test"
-	owner := "dohyung97022"
-	client, err := initClient(&token)
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-	err = client.createRepository("", repoName)
+func CreateS3WebsiteRepository(region *string, repoName *string, bucketName *string, awsAccessKey *string,
+	awsSecretAccessKey *string, cloudFrontDistributionId *string, template FrontendTemplate, commitMessage *string, branch *string) error {
+	fmt.Println("createRepository")
+	err := client.createRepository("", *repoName)
 	if err != nil { // 404 라면 권한이 없는 것일 수도 있다.
-		fmt.Println(err)
-		os.Exit(1)
+		return err
 	}
-
-	err = client.createFolder(external, owner, repoName, "embed/go/src", "embed/go/")
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-}
-
-func initClient(accessToken *string) (*Client, error) {
-	return (*Client)(github.NewClient(nil).WithAuthToken(*accessToken)), nil
-}
-
-func (client *Client) createRepository(organization string, repoName string) error {
-	repo := github.Repository{Name: &repoName}
-	_, _, err := client.Repositories.Create(ctx, organization, &repo)
-	return err
-}
-
-func (client *Client) createFolder(embedded embed.FS, owner string, repoName string, path string, removePath string) error {
-	open, err := embedded.Open(path)
+	fmt.Println("createReadme")
+	err = client.createReadme(repoName, "", commitMessage, branch)
 	if err != nil {
 		return err
 	}
-	stat, err := open.Stat()
+	fmt.Println("saveSecret")
+	err = client.saveSecret(*repoName, "AWS_ACCESS_KEY_ID", *awsAccessKey)
 	if err != nil {
 		return err
 	}
-	if stat.IsDir() {
-		dir, err := embedded.ReadDir(path)
-		if err != nil {
-			return err
-		}
-		for _, entry := range dir {
-			err := client.createFolder(embedded, owner, repoName, path+"/"+entry.Name(), removePath)
-			if err != nil {
-				return err
-			}
-		}
-	} else {
-		content, err := external.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		err = client.createFile(owner, repoName, path, content, removePath)
-		if err != nil {
-			return err
-		}
+	fmt.Println("saveSecret")
+	err = client.saveSecret(*repoName, "AWS_SECRET_ACCESS_KEY", *awsSecretAccessKey)
+	if err != nil {
+		return err
+	}
+	fmt.Println("saveSecret")
+	err = client.saveSecret(*repoName, "AWS_CLOUDFRONT_DISTRIBUTION_ID", *cloudFrontDistributionId) // E265G1FI21SHCH
+	if err != nil {
+		return err
+	}
+	fmt.Println("saveSecret")
+	err = client.saveSecret(*repoName, "AWS_REGION", *region)
+	if err != nil {
+		return err
+	}
+	fmt.Println("saveSecret")
+	err = client.saveSecret(*repoName, "AWS_BUCKET_NAME", *bucketName)
+	if err != nil {
+		return err
+	}
+	fmt.Println("createFolder")
+	entries := make([]*github.TreeEntry, 0)
+	err = client.createFolder(embedded, *repoName, &entries, template.path, template.removePath, &template.gitIgnore)
+	if err != nil {
+		return err
+	}
+	fmt.Println("getBranch")
+	repoCommit, baseTree, err := client.getBranch(repoName, branch)
+	if err != nil {
+		return err
+	}
+	fmt.Println("createBlobTree")
+	createdTree, err := client.createBlobTree(repoName, baseTree, &entries)
+	if err != nil { // 404 라면 workflow 권한이 없을 수도 있다.
+		return err
+	}
+	fmt.Println("createCommit")
+	createdCommit, err := client.createCommit(repoName, commitMessage, createdTree, &github.Commit{SHA: repoCommit.SHA})
+	if err != nil {
+		return err
+	}
+	fmt.Println("updateRef")
+	err = client.updateRef(repoName, createdCommit)
+	if err != nil {
+		return err
 	}
 	return nil
 }
 
-func (client *Client) createFile(owner string, repoName string, gitPath string, content []byte, removePath string) error {
-	gitPath = strings.Replace(gitPath, removePath, "", 1)
-	options := github.RepositoryContentFileOptions{
-		Message: github.String("testing123"),
-		Content: content,
-		Branch:  github.String("main"),
+func CreateCodeRepository(region *string, awsAccessKey *string, awsSecretAccessKey *string, ecrName *string,
+	clusterName *string, serviceName *string, taskFamilyName *string, containerName *string, repoName *string,
+	branch *string, template BackendTemplate) error {
+	commitMessage := "good first commit from codeTemplate"
+	fmt.Println("createRepository")
+	err := client.createRepository("", *repoName)
+	fmt.Println("createReadme")
+	err = client.createReadme(repoName, "", &commitMessage, branch)
+	if err != nil {
+		return err
 	}
-	_, _, err := client.Repositories.CreateFile(ctx, owner, repoName, gitPath, &options)
-	return err
+	fmt.Println("saveSecret")
+	err = client.saveSecret(*repoName, "AWS_ACCESS_KEY_ID", *awsAccessKey)
+	if err != nil {
+		return err
+	}
+	fmt.Println("saveSecret")
+	err = client.saveSecret(*repoName, "AWS_SECRET_ACCESS_KEY", *awsSecretAccessKey)
+	if err != nil {
+		return err
+	}
+	fmt.Println("saveSecret")
+	err = client.saveSecret(*repoName, "AWS_REGION", *region)
+	if err != nil {
+		return err
+	}
+	fmt.Println("saveSecret")
+	err = client.saveSecret(*repoName, "AWS_ECR_REPOSITORY", *ecrName)
+	if err != nil {
+		return err
+	}
+	fmt.Println("saveSecret")
+	err = client.saveSecret(*repoName, "AWS_ECS_CLUSTER", *clusterName)
+	if err != nil {
+		return err
+	}
+	fmt.Println("saveSecret")
+	err = client.saveSecret(*repoName, "AWS_ECS_SERVICE", *serviceName)
+	if err != nil {
+		return err
+	}
+	fmt.Println("saveSecret")
+	err = client.saveSecret(*repoName, "AWS_ECS_TASK_DEFINITION", *taskFamilyName)
+	if err != nil {
+		return err
+	}
+	fmt.Println("saveSecret")
+	err = client.saveSecret(*repoName, "AWS_ECS_TASK_CONTAINER_NAME", *containerName)
+	if err != nil {
+		return err
+	}
+	fmt.Println("createFolder")
+	entries := make([]*github.TreeEntry, 0)
+	err = client.createFolder(embedded, *repoName, &entries, template.path, template.removePath, &template.gitIgnore)
+	if err != nil {
+		return err
+	}
+	fmt.Println("getBranch")
+	repoCommit, baseTree, err := client.getBranch(repoName, branch)
+	if err != nil {
+		return err
+	}
+	fmt.Println("createBlobTree")
+	createdTree, err := client.createBlobTree(repoName, baseTree, &entries)
+	if err != nil {
+		return err
+	}
+	fmt.Println("createCommit")
+	createdCommit, err := client.createCommit(repoName, &commitMessage, createdTree, &github.Commit{SHA: repoCommit.SHA})
+	if err != nil {
+		return err
+	}
+	fmt.Println("updateRef")
+	err = client.updateRef(repoName, createdCommit)
+	if err != nil {
+		return err
+	}
+	return nil
 }
